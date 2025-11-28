@@ -56,12 +56,19 @@ var _ = (fs.NodeRenamer)((*GPGFSNode)(nil))
 var _ = (fs.NodeOpener)((*GPGFSNode)(nil))
 var _ = (fs.NodeSymlinker)((*GPGFSNode)(nil))
 var _ = (fs.NodeReadlinker)((*GPGFSNode)(nil))
+var _ = (fs.NodeStatfser)((*GPGFSNode)(nil))
+var _ = (fs.NodeAccesser)((*GPGFSNode)(nil))
+
+// Default cache timeout for attributes and entries
+const attrCacheTimeout = 1 * time.Second
+const entryCacheTimeout = 1 * time.Second
 
 // Getattr returns file attributes.
 func (n *GPGFSNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 
+	out.SetTimeout(attrCacheTimeout)
 	return n.getAttrLocked(out)
 }
 
@@ -180,6 +187,8 @@ func (n *GPGFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	out.Mode = mode
 	out.Uid = uint32(os.Getuid())
 	out.Gid = uint32(os.Getgid())
+	out.SetEntryTimeout(entryCacheTimeout)
+	out.SetAttrTimeout(attrCacheTimeout)
 
 	return n.NewInode(ctx, child, stable), 0
 }
@@ -238,6 +247,8 @@ func (n *GPGFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *fu
 	out.Mode = syscall.S_IFDIR | mode
 	out.Uid = uint32(os.Getuid())
 	out.Gid = uint32(os.Getgid())
+	out.SetEntryTimeout(entryCacheTimeout)
+	out.SetAttrTimeout(attrCacheTimeout)
 
 	return n.NewInode(ctx, child, stable), 0
 }
@@ -268,6 +279,8 @@ func (n *GPGFSNode) Create(ctx context.Context, name string, flags uint32, mode 
 	out.Mode = syscall.S_IFREG | mode
 	out.Uid = uint32(os.Getuid())
 	out.Gid = uint32(os.Getgid())
+	out.SetEntryTimeout(entryCacheTimeout)
+	out.SetAttrTimeout(attrCacheTimeout)
 
 	handle := &GPGFileHandle{
 		node: child,
@@ -340,6 +353,8 @@ func (n *GPGFSNode) Symlink(ctx context.Context, target, name string, out *fuse.
 	out.Mode = syscall.S_IFLNK | 0777
 	out.Uid = uint32(os.Getuid())
 	out.Gid = uint32(os.Getgid())
+	out.SetEntryTimeout(entryCacheTimeout)
+	out.SetAttrTimeout(attrCacheTimeout)
 
 	return n.NewInode(ctx, child, stable), 0
 }
@@ -359,6 +374,40 @@ func (n *GPGFSNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	}
 
 	return []byte(entry.Target), 0
+}
+
+// Statfs returns filesystem statistics.
+func (n *GPGFSNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	// Report generous filesystem capacity so apps don't think it's full
+	// Using 1TB virtual capacity with 500GB free
+	const blockSize = 4096
+	const totalBlocks = (1024 * 1024 * 1024 * 1024) / blockSize // 1TB
+	const freeBlocks = (500 * 1024 * 1024 * 1024) / blockSize   // 500GB free
+
+	out.Blocks = totalBlocks
+	out.Bfree = freeBlocks
+	out.Bavail = freeBlocks
+	out.Files = 1000000    // Max inodes
+	out.Ffree = 999000     // Free inodes
+	out.Bsize = blockSize  // Block size
+	out.NameLen = 255      // Max filename length
+	out.Frsize = blockSize // Fragment size
+
+	return 0
+}
+
+// Access checks file permissions.
+func (n *GPGFSNode) Access(ctx context.Context, mask uint32) syscall.Errno {
+	// Check if the entry exists
+	entry, err := n.storage.GetEntry(n.path)
+	if err != nil {
+		return syscall.ENOENT
+	}
+
+	// For simplicity, if the entry exists and belongs to the current user,
+	// allow all requested access modes (since we own everything in our encrypted fs)
+	_ = entry
+	return 0
 }
 
 // Rename moves/renames a file or directory.
@@ -418,10 +467,12 @@ func (n *GPGFSNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint
 	return &GPGFileHandle{node: n}, 0, 0
 }
 
-// GPGFileHandle implements file operations.
+// GPGFileHandle implements file operations with write buffering.
 type GPGFileHandle struct {
-	node *GPGFSNode
-	mu   sync.Mutex
+	node   *GPGFSNode
+	mu     sync.Mutex
+	buffer []byte // in-memory write buffer
+	dirty  bool   // true if buffer has unpersisted changes
 }
 
 var _ = (fs.FileReader)((*GPGFileHandle)(nil))
@@ -430,6 +481,7 @@ var _ = (fs.FileFlusher)((*GPGFileHandle)(nil))
 var _ = (fs.FileSetattrer)((*GPGFileHandle)(nil))
 var _ = (fs.FileGetattrer)((*GPGFileHandle)(nil))
 var _ = (fs.FileFsyncer)((*GPGFileHandle)(nil))
+var _ = (fs.FileReleaser)((*GPGFileHandle)(nil))
 
 // Getattr returns file attributes via the file handle.
 func (fh *GPGFileHandle) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
@@ -442,7 +494,12 @@ func (fh *GPGFileHandle) Getattr(ctx context.Context, out *fuse.AttrOut) syscall
 	}
 
 	out.Ino = entry.Inode
-	out.Size = uint64(entry.Size)
+	// Return buffer size if we have pending writes
+	if fh.buffer != nil {
+		out.Size = uint64(len(fh.buffer))
+	} else {
+		out.Size = uint64(entry.Size)
+	}
 	out.Mtime = uint64(entry.ModTime.Unix())
 	out.Ctime = uint64(entry.ModTime.Unix())
 	out.Atime = uint64(entry.ModTime.Unix())
@@ -481,8 +538,13 @@ func (fh *GPGFileHandle) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *f
 	// Handle truncation
 	if sz, ok := in.GetSize(); ok {
 		if entry.Type == storage.FileTypeRegular {
-			// Read existing data
-			existing, _ := fh.node.storage.ReadFile(fh.node.path)
+			// Use buffer if we have one, otherwise read from storage
+			var existing []byte
+			if fh.buffer != nil {
+				existing = fh.buffer
+			} else {
+				existing, _ = fh.node.storage.ReadFile(fh.node.path)
+			}
 
 			var newData []byte
 			if sz == 0 {
@@ -496,9 +558,9 @@ func (fh *GPGFileHandle) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *f
 				newData = existing
 			}
 
-			if err := fh.node.storage.WriteFile(fh.node.path, newData); err != nil {
-				return syscall.EIO
-			}
+			// Update buffer instead of writing directly to storage
+			fh.buffer = newData
+			fh.dirty = true
 			entry.Size = int64(sz)
 		}
 	}
@@ -538,14 +600,21 @@ func (fh *GPGFileHandle) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *f
 	return 0
 }
 
-// Read reads data from the file.
+// Read reads data from the file (uses buffer if dirty, otherwise storage).
 func (fh *GPGFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 
-	data, err := fh.node.storage.ReadFile(fh.node.path)
-	if err != nil {
-		return nil, syscall.EIO
+	// Use buffer if we have pending writes, otherwise read from storage
+	var data []byte
+	if fh.buffer != nil {
+		data = fh.buffer
+	} else {
+		var err error
+		data, err = fh.node.storage.ReadFile(fh.node.path)
+		if err != nil {
+			return nil, syscall.EIO
+		}
 	}
 
 	if off >= int64(len(data)) {
@@ -560,39 +629,67 @@ func (fh *GPGFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse
 	return fuse.ReadResultData(data[off:end]), 0
 }
 
-// Write writes data to the file.
+// Write writes data to the in-memory buffer (flushed on Flush/Release).
 func (fh *GPGFileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 
-	// Read existing data
-	existing, _ := fh.node.storage.ReadFile(fh.node.path)
+	// Initialize buffer from storage if this is the first write
+	if fh.buffer == nil {
+		existing, _ := fh.node.storage.ReadFile(fh.node.path)
+		if existing == nil {
+			existing = []byte{}
+		}
+		fh.buffer = existing
+	}
 
-	// Extend if necessary
+	// Extend buffer if necessary
 	requiredLen := off + int64(len(data))
-	if int64(len(existing)) < requiredLen {
+	if int64(len(fh.buffer)) < requiredLen {
 		newData := make([]byte, requiredLen)
-		copy(newData, existing)
-		existing = newData
+		copy(newData, fh.buffer)
+		fh.buffer = newData
 	}
 
-	// Write the new data
-	copy(existing[off:], data)
-
-	if err := fh.node.storage.WriteFile(fh.node.path, existing); err != nil {
-		return 0, syscall.EIO
-	}
+	// Write the new data to buffer
+	copy(fh.buffer[off:], data)
+	fh.dirty = true
 
 	return uint32(len(data)), 0
 }
 
-// Flush flushes any buffered data.
-func (fh *GPGFileHandle) Flush(ctx context.Context) syscall.Errno {
+// flushBuffer persists the in-memory buffer to storage if dirty.
+func (fh *GPGFileHandle) flushBuffer() syscall.Errno {
+	if !fh.dirty || fh.buffer == nil {
+		return 0
+	}
+
+	if err := fh.node.storage.WriteFile(fh.node.path, fh.buffer); err != nil {
+		return syscall.EIO
+	}
+	fh.dirty = false
 	return 0
+}
+
+// Flush flushes any buffered data to storage.
+func (fh *GPGFileHandle) Flush(ctx context.Context) syscall.Errno {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	return fh.flushBuffer()
 }
 
 // Fsync synchronizes file contents to storage.
 func (fh *GPGFileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
-	// Data is already written synchronously to storage, so this is a no-op
-	return 0
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	return fh.flushBuffer()
+}
+
+// Release is called when the file handle is closed. Ensures data is flushed.
+func (fh *GPGFileHandle) Release(ctx context.Context) syscall.Errno {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	errno := fh.flushBuffer()
+	fh.buffer = nil // free memory
+	return errno
 }
