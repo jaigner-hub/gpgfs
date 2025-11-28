@@ -54,6 +54,8 @@ var _ = (fs.NodeUnlinker)((*GPGFSNode)(nil))
 var _ = (fs.NodeRmdirer)((*GPGFSNode)(nil))
 var _ = (fs.NodeRenamer)((*GPGFSNode)(nil))
 var _ = (fs.NodeOpener)((*GPGFSNode)(nil))
+var _ = (fs.NodeSymlinker)((*GPGFSNode)(nil))
+var _ = (fs.NodeReadlinker)((*GPGFSNode)(nil))
 
 // Getattr returns file attributes.
 func (n *GPGFSNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -77,10 +79,14 @@ func (n *GPGFSNode) getAttrLocked(out *fuse.AttrOut) syscall.Errno {
 	out.Uid = uint32(os.Getuid())
 	out.Gid = uint32(os.Getgid())
 
-	if entry.Type == storage.FileTypeDirectory {
+	switch entry.Type {
+	case storage.FileTypeDirectory:
 		out.Mode = uint32(entry.Mode) | syscall.S_IFDIR
 		out.Nlink = 2
-	} else {
+	case storage.FileTypeSymlink:
+		out.Mode = uint32(entry.Mode) | syscall.S_IFLNK
+		out.Nlink = 1
+	default:
 		out.Mode = uint32(entry.Mode) | syscall.S_IFREG
 		out.Nlink = 1
 	}
@@ -154,9 +160,12 @@ func (n *GPGFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	}
 
 	var mode uint32
-	if entry.Type == storage.FileTypeDirectory {
+	switch entry.Type {
+	case storage.FileTypeDirectory:
 		mode = syscall.S_IFDIR | uint32(entry.Mode)
-	} else {
+	case storage.FileTypeSymlink:
+		mode = syscall.S_IFLNK | uint32(entry.Mode)
+	default:
 		mode = syscall.S_IFREG | uint32(entry.Mode)
 	}
 
@@ -184,9 +193,14 @@ func (n *GPGFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 	var dirEntries []fuse.DirEntry
 	for _, e := range entries {
-		mode := uint32(syscall.S_IFREG)
-		if e.Type == storage.FileTypeDirectory {
+		var mode uint32
+		switch e.Type {
+		case storage.FileTypeDirectory:
 			mode = syscall.S_IFDIR
+		case storage.FileTypeSymlink:
+			mode = syscall.S_IFLNK
+		default:
+			mode = syscall.S_IFREG
 		}
 		dirEntries = append(dirEntries, fuse.DirEntry{
 			Name: e.Name,
@@ -299,6 +313,54 @@ func (n *GPGFSNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	return 0
 }
 
+// Symlink creates a symbolic link.
+func (n *GPGFSNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	childPath := filepath.Join(n.path, name)
+
+	entry, err := n.storage.CreateSymlink(childPath, target)
+	if err != nil {
+		if err == storage.ErrAlreadyExists {
+			return nil, syscall.EEXIST
+		}
+		return nil, syscall.EIO
+	}
+
+	child := &GPGFSNode{
+		storage: n.storage,
+		path:    childPath,
+	}
+
+	stable := fs.StableAttr{
+		Mode: syscall.S_IFLNK | 0777,
+		Ino:  entry.Inode,
+	}
+
+	out.Ino = entry.Inode
+	out.Size = uint64(entry.Size)
+	out.Mode = syscall.S_IFLNK | 0777
+	out.Uid = uint32(os.Getuid())
+	out.Gid = uint32(os.Getgid())
+
+	return n.NewInode(ctx, child, stable), 0
+}
+
+// Readlink reads the target of a symbolic link.
+func (n *GPGFSNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+
+	entry, err := n.storage.GetEntry(n.path)
+	if err != nil {
+		return nil, syscall.ENOENT
+	}
+
+	if entry.Type != storage.FileTypeSymlink {
+		return nil, syscall.EINVAL
+	}
+
+	return []byte(entry.Target), 0
+}
+
 // Rename moves/renames a file or directory.
 func (n *GPGFSNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	oldPath := filepath.Join(n.path, name)
@@ -387,10 +449,14 @@ func (fh *GPGFileHandle) Getattr(ctx context.Context, out *fuse.AttrOut) syscall
 	out.Uid = uint32(os.Getuid())
 	out.Gid = uint32(os.Getgid())
 
-	if entry.Type == storage.FileTypeDirectory {
+	switch entry.Type {
+	case storage.FileTypeDirectory:
 		out.Mode = uint32(entry.Mode) | syscall.S_IFDIR
 		out.Nlink = 2
-	} else {
+	case storage.FileTypeSymlink:
+		out.Mode = uint32(entry.Mode) | syscall.S_IFLNK
+		out.Nlink = 1
+	default:
 		out.Mode = uint32(entry.Mode) | syscall.S_IFREG
 		out.Nlink = 1
 	}
@@ -457,10 +523,14 @@ func (fh *GPGFileHandle) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *f
 	out.Uid = uint32(os.Getuid())
 	out.Gid = uint32(os.Getgid())
 
-	if entry.Type == storage.FileTypeDirectory {
+	switch entry.Type {
+	case storage.FileTypeDirectory:
 		out.Mode = uint32(entry.Mode) | syscall.S_IFDIR
 		out.Nlink = 2
-	} else {
+	case storage.FileTypeSymlink:
+		out.Mode = uint32(entry.Mode) | syscall.S_IFLNK
+		out.Nlink = 1
+	default:
 		out.Mode = uint32(entry.Mode) | syscall.S_IFREG
 		out.Nlink = 1
 	}

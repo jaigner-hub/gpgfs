@@ -2,11 +2,14 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -20,14 +23,22 @@ import (
 
 func main() {
 	var (
-		mountPoint    string
-		containerPath string
-		debug         bool
+		mountPoint      string
+		containerPath   string
+		debug           bool
+		passphraseStdin bool
+		daemonize       bool
+		allowOther      bool
+		childProcess    bool
 	)
 
 	flag.StringVar(&mountPoint, "mount", "", "Mount point for the filesystem")
 	flag.StringVar(&containerPath, "container", "", "Path to encrypted container file")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
+	flag.BoolVar(&passphraseStdin, "passphrase-stdin", false, "Read passphrase from stdin (no prompt)")
+	flag.BoolVar(&daemonize, "daemonize", false, "Fork to background after mounting")
+	flag.BoolVar(&allowOther, "allow-other", false, "Allow other users to access the mount")
+	flag.BoolVar(&childProcess, "child", false, "Internal flag: indicates this is a daemonized child process")
 	flag.Parse()
 
 	if mountPoint == "" || containerPath == "" {
@@ -40,12 +51,68 @@ func main() {
 	}
 
 	// Read passphrase
-	fmt.Print("Enter passphrase: ")
-	passphrase, err := term.ReadPassword(int(syscall.Stdin))
-	if err != nil {
-		log.Fatalf("Failed to read passphrase: %v", err)
+	var passphrase []byte
+	var err error
+	if passphraseStdin {
+		// Read from stdin without prompt (for PAM/scripted use)
+		reader := bufio.NewReader(os.Stdin)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			log.Fatalf("Failed to read passphrase from stdin: %v", err)
+		}
+		passphrase = []byte(strings.TrimRight(line, "\r\n"))
+	} else {
+		// Interactive mode with prompt
+		fmt.Print("Enter passphrase: ")
+		passphrase, err = term.ReadPassword(int(syscall.Stdin))
+		if err != nil {
+			log.Fatalf("Failed to read passphrase: %v", err)
+		}
+		fmt.Println()
 	}
-	fmt.Println()
+
+	// Handle daemonization: re-exec as a child process that runs in background
+	if daemonize && !childProcess {
+		// Build args for child process
+		args := []string{
+			"-mount", mountPoint,
+			"-container", containerPath,
+			"-passphrase-stdin",
+			"-child",
+		}
+		if debug {
+			args = append(args, "-debug")
+		}
+		if allowOther {
+			args = append(args, "-allow-other")
+		}
+
+		cmd := exec.Command(os.Args[0], args...)
+
+		// Create a pipe to pass the passphrase to the child
+		stdinPipe, err := cmd.StdinPipe()
+		if err != nil {
+			log.Fatalf("Failed to create stdin pipe: %v", err)
+		}
+
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		// Start child
+		if err := cmd.Start(); err != nil {
+			log.Fatalf("Failed to daemonize: %v", err)
+		}
+
+		// Write passphrase to child's stdin and close the pipe
+		_, err = stdinPipe.Write([]byte(string(passphrase) + "\n"))
+		if err != nil {
+			log.Fatalf("Failed to write passphrase to child: %v", err)
+		}
+		stdinPipe.Close()
+
+		fmt.Printf("GPGFS daemonizing (pid %d)...\n", cmd.Process.Pid)
+		os.Exit(0)
+	}
 
 	// Initialize storage (opens or creates the container file)
 	store, err := storage.NewStorage(containerPath, string(passphrase))
@@ -69,6 +136,7 @@ func main() {
 			Name:          "gpgfs",
 			DisableXAttrs: true,
 			Debug:         debug,
+			AllowOther:    allowOther,
 		},
 	}
 
@@ -78,8 +146,10 @@ func main() {
 		log.Fatalf("Failed to mount filesystem: %v", err)
 	}
 
-	fmt.Printf("GPGFS mounted at %s\n", mountPoint)
-	fmt.Println("Press Ctrl+C to unmount and exit")
+	if !childProcess {
+		fmt.Printf("GPGFS mounted at %s\n", mountPoint)
+		fmt.Println("Press Ctrl+C to unmount and exit")
+	}
 
 	// Handle signals for clean shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -102,5 +172,7 @@ func main() {
 
 	// Wait for the server to finish
 	server.Wait()
-	fmt.Println("Filesystem unmounted")
+	if !childProcess {
+		fmt.Println("Filesystem unmounted")
+	}
 }
