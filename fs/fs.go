@@ -319,7 +319,36 @@ func (n *GPGFSNode) Rename(ctx context.Context, name string, newParent fs.InodeE
 		return syscall.EIO
 	}
 
+	// Update the inode tree to reflect the rename
+	child := n.GetChild(name)
+	if child != nil {
+		// Update paths recursively for the child and all its descendants
+		updatePathsRecursive(child, oldPath, newPath)
+		// Move the child in the inode tree
+		newParentInode := newParentNode.EmbeddedInode()
+		n.MvChild(name, newParentInode, newName, true)
+	}
+
 	return 0
+}
+
+// updatePathsRecursive updates the path field for a node and all its children
+func updatePathsRecursive(inode *fs.Inode, oldPrefix, newPrefix string) {
+	if node, ok := inode.Operations().(*GPGFSNode); ok {
+		node.mu.Lock()
+		// Replace the old prefix with the new prefix in this node's path
+		if node.path == oldPrefix {
+			node.path = newPrefix
+		} else if len(node.path) > len(oldPrefix) && node.path[:len(oldPrefix)+1] == oldPrefix+"/" {
+			node.path = newPrefix + node.path[len(oldPrefix):]
+		}
+		node.mu.Unlock()
+	}
+
+	// Recursively update all children
+	for _, childInode := range inode.Children() {
+		updatePathsRecursive(childInode, oldPrefix, newPrefix)
+	}
 }
 
 // Open opens a file.
