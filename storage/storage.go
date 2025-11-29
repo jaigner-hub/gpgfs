@@ -39,6 +39,10 @@ type FileType int
 const (
 	FileTypeRegular FileType = iota
 	FileTypeDirectory
+<<<<<<< Updated upstream
+=======
+	FileTypeSocket
+>>>>>>> Stashed changes
 	FileTypeSymlink
 )
 
@@ -50,6 +54,7 @@ type FileEntry struct {
 	Mode    uint32    `json:"mode"`
 	ModTime time.Time `json:"mod_time"`
 	Inode   uint64    `json:"inode"`
+<<<<<<< Updated upstream
 	Target  string    `json:"target,omitempty"` // Symlink target path
 }
 
@@ -226,6 +231,9 @@ func (fl *fileLock) releaseLock(path string) {
 		delete(fl.locks, path)
 		delete(fl.refCount, path)
 	}
+=======
+	Target  string    `json:"target,omitempty"` // For symlinks
+>>>>>>> Stashed changes
 }
 
 // Storage manages encrypted file storage in a single file.
@@ -566,6 +574,7 @@ func (s *Storage) CreateDirectory(path string, mode uint32) (*FileEntry, error) 
 	return entry, nil
 }
 
+<<<<<<< Updated upstream
 // CreateSymlink creates a new symlink entry.
 func (s *Storage) CreateSymlink(path string, target string) (*FileEntry, error) {
 	lock := s.fileLocks.getLock(path)
@@ -574,6 +583,75 @@ func (s *Storage) CreateSymlink(path string, target string) (*FileEntry, error) 
 		lock.Unlock()
 		s.fileLocks.releaseLock(path)
 	}()
+=======
+// CreateSocket creates a new socket entry.
+func (s *Storage) CreateSocket(path string, mode uint32) (*FileEntry, error) {
+	s.metaLock.Lock()
+	defer s.metaLock.Unlock()
+
+	inode, err := s.nextInode()
+	if err != nil {
+		return nil, err
+	}
+
+	entry := &FileEntry{
+		Name:    filepath.Base(path),
+		Type:    FileTypeSocket,
+		Size:    0,
+		Mode:    mode,
+		ModTime: time.Now(),
+		Inode:   inode,
+	}
+
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		metaBucket := tx.Bucket(bucketMeta)
+
+		// Check if already exists
+		if metaBucket.Get([]byte(path)) != nil {
+			return ErrAlreadyExists
+		}
+
+		// Check parent exists and is a directory
+		parent := filepath.Dir(path)
+		parentData := metaBucket.Get([]byte(parent))
+		if parentData == nil {
+			return ErrNotFound
+		}
+		decParent, err := s.gpg.Decrypt(parentData)
+		if err != nil {
+			return err
+		}
+		var parentEntry FileEntry
+		if err := json.Unmarshal(decParent, &parentEntry); err != nil {
+			return err
+		}
+		if parentEntry.Type != FileTypeDirectory {
+			return ErrNotDirectory
+		}
+
+		// Save the new entry
+		entryData, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		encData, err := s.gpg.Encrypt(entryData)
+		if err != nil {
+			return err
+		}
+		return metaBucket.Put([]byte(path), encData)
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	return entry, nil
+}
+
+// CreateSymlink creates a new symlink entry.
+func (s *Storage) CreateSymlink(path string, target string) (*FileEntry, error) {
+	s.metaLock.Lock()
+	defer s.metaLock.Unlock()
+>>>>>>> Stashed changes
 
 	inode, err := s.nextInode()
 	if err != nil {
@@ -584,7 +662,11 @@ func (s *Storage) CreateSymlink(path string, target string) (*FileEntry, error) 
 		Name:    filepath.Base(path),
 		Type:    FileTypeSymlink,
 		Size:    int64(len(target)),
+<<<<<<< Updated upstream
 		Mode:    0777, // Symlinks typically have 0777 mode
+=======
+		Mode:    0777,
+>>>>>>> Stashed changes
 		ModTime: time.Now(),
 		Inode:   inode,
 		Target:  target,
@@ -767,7 +849,11 @@ func (s *Storage) ReadFile(path string) ([]byte, error) {
 	return result, nil
 }
 
+<<<<<<< Updated upstream
 // DeleteFile removes a file or symlink.
+=======
+// DeleteFile removes a file, socket, or symlink.
+>>>>>>> Stashed changes
 func (s *Storage) DeleteFile(path string) error {
 	lock := s.fileLocks.getLock(path)
 	lock.Lock()
@@ -797,7 +883,11 @@ func (s *Storage) DeleteFile(path string) error {
 			return ErrIsDirectory
 		}
 
+<<<<<<< Updated upstream
 		// Delete data (only for regular files, symlinks have no data)
+=======
+		// Delete data (only for regular files)
+>>>>>>> Stashed changes
 		if entry.Type == FileTypeRegular {
 			dataBucket.Delete(uint64ToBytes(entry.Inode))
 		}
