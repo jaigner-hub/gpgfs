@@ -57,15 +57,12 @@ var _ = (fs.NodeRenamer)((*GPGFSNode)(nil))
 var _ = (fs.NodeOpener)((*GPGFSNode)(nil))
 var _ = (fs.NodeSymlinker)((*GPGFSNode)(nil))
 var _ = (fs.NodeReadlinker)((*GPGFSNode)(nil))
-<<<<<<< Updated upstream
 var _ = (fs.NodeStatfser)((*GPGFSNode)(nil))
 var _ = (fs.NodeAccesser)((*GPGFSNode)(nil))
 
 // Default cache timeout for attributes and entries
 const attrCacheTimeout = 1 * time.Second
 const entryCacheTimeout = 1 * time.Second
-=======
->>>>>>> Stashed changes
 
 // Getattr returns file attributes.
 func (n *GPGFSNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -94,12 +91,9 @@ func (n *GPGFSNode) getAttrLocked(out *fuse.AttrOut) syscall.Errno {
 	case storage.FileTypeDirectory:
 		out.Mode = uint32(entry.Mode) | syscall.S_IFDIR
 		out.Nlink = 2
-<<<<<<< Updated upstream
-=======
 	case storage.FileTypeSocket:
 		out.Mode = uint32(entry.Mode) | syscall.S_IFSOCK
 		out.Nlink = 1
->>>>>>> Stashed changes
 	case storage.FileTypeSymlink:
 		out.Mode = uint32(entry.Mode) | syscall.S_IFLNK
 		out.Nlink = 1
@@ -180,11 +174,8 @@ func (n *GPGFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	switch entry.Type {
 	case storage.FileTypeDirectory:
 		mode = syscall.S_IFDIR | uint32(entry.Mode)
-<<<<<<< Updated upstream
-=======
 	case storage.FileTypeSocket:
 		mode = syscall.S_IFSOCK | uint32(entry.Mode)
->>>>>>> Stashed changes
 	case storage.FileTypeSymlink:
 		mode = syscall.S_IFLNK | uint32(entry.Mode)
 	default:
@@ -221,11 +212,8 @@ func (n *GPGFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		switch e.Type {
 		case storage.FileTypeDirectory:
 			mode = syscall.S_IFDIR
-<<<<<<< Updated upstream
-=======
 		case storage.FileTypeSocket:
 			mode = syscall.S_IFSOCK
->>>>>>> Stashed changes
 		case storage.FileTypeSymlink:
 			mode = syscall.S_IFLNK
 		default:
@@ -315,51 +303,6 @@ func (n *GPGFSNode) Mknod(ctx context.Context, name string, mode uint32, dev uin
 	out.Gid = uint32(os.Getgid())
 
 	return n.NewInode(ctx, child, stable), 0
-}
-
-// Symlink creates a symbolic link.
-func (n *GPGFSNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	childPath := filepath.Join(n.path, name)
-
-	entry, err := n.storage.CreateSymlink(childPath, target)
-	if err != nil {
-		if err == storage.ErrAlreadyExists {
-			return nil, syscall.EEXIST
-		}
-		return nil, syscall.EIO
-	}
-
-	child := &GPGFSNode{
-		storage: n.storage,
-		path:    childPath,
-	}
-
-	stable := fs.StableAttr{
-		Mode: syscall.S_IFLNK | 0777,
-		Ino:  entry.Inode,
-	}
-
-	out.Ino = entry.Inode
-	out.Size = uint64(len(target))
-	out.Mode = syscall.S_IFLNK | 0777
-	out.Uid = uint32(os.Getuid())
-	out.Gid = uint32(os.Getgid())
-
-	return n.NewInode(ctx, child, stable), 0
-}
-
-// Readlink reads a symbolic link's target.
-func (n *GPGFSNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
-	entry, err := n.storage.GetEntry(n.path)
-	if err != nil {
-		return nil, syscall.ENOENT
-	}
-
-	if entry.Type != storage.FileTypeSymlink {
-		return nil, syscall.EINVAL
-	}
-
-	return []byte(entry.Target), 0
 }
 
 // Create creates a new file.
